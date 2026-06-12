@@ -396,10 +396,11 @@
     <div id="leaderboard"></div>
   </div>
 
-  <p class="footer-note">Level 1 = am einfachsten, Level 1000 = am schwersten.<br>Fortschritt und Bestenliste werden lokal in deinem Browser gespeichert.</p>
+  <p class="footer-note">Level 1 = am einfachsten, Level 1000 = am schwersten.<br>Dein Fortschritt wird lokal gespeichert, die Bestenliste ist für alle sichtbar.</p>
 </div>
 
 <script src="puzzles_data.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
 <script>
 const SIZE = 6;
 const FIRE_SVG = `<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2c1 3-2 4-2 7a3 3 0 0 0 6 0c1.5 1.5 2 3.5 2 5a6 6 0 0 1-12 0c0-5 4-7 6-12z"/></svg>`;
@@ -711,36 +712,40 @@ function launchConfetti(){
   }
 }
 
-// ---- leaderboard (localStorage based, per-browser "shared" simulation) ----
-function loadLeaderboard(){
-  return loadJSON('tango_leaderboard', {});
-}
-function saveLeaderboard(data){
-  saveJSON('tango_leaderboard', data);
-}
+// ---- leaderboard (Supabase) ----
+const SUPABASE_URL = 'https://ljxjpqtgydzhowmuqkrr.supabase.co';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImxqeGpwcXRneWR6aG93bXVxa3JyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODEyNTgzODYsImV4cCI6MjA5NjgzNDM4Nn0.AVGqdhOYnjdT-wAc3h30Zkvjp3pARh3U4zVK7ae-OQQ';
+const supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
-function renderLeaderboard(){
-  const lb = loadLeaderboard();
-  const entries = Object.values(lb);
+async function renderLeaderboard(){
+  leaderboardEl.innerHTML = '<p class="lb-empty">Lädt…</p>';
 
-  let sorted;
+  let query = supabaseClient.from('leaderboard').select('name,best_time,solved_count');
   if(leaderboardTab === 'time'){
-    sorted = entries.filter(e => e.bestTime != null).sort((a,b) => a.bestTime - b.bestTime);
+    query = query.not('best_time', 'is', null).order('best_time', { ascending: true });
   } else {
-    sorted = entries.slice().sort((a,b) => (b.solvedCount||0) - (a.solvedCount||0));
+    query = query.order('solved_count', { ascending: false });
   }
-  sorted = sorted.slice(0, 10);
+  query = query.limit(10);
 
-  if(sorted.length === 0){
+  const { data, error } = await query;
+
+  if(error){
+    leaderboardEl.innerHTML = '<p class="lb-empty">Bestenliste konnte nicht geladen werden</p>';
+    console.error('Leaderboard load error', error);
+    return;
+  }
+
+  if(!data || data.length === 0){
     leaderboardEl.innerHTML = '<p class="lb-empty">Noch keine Einträge</p>';
     return;
   }
 
   let rows = '';
-  sorted.forEach((e, i) => {
+  data.forEach((e, i) => {
     const value = leaderboardTab === 'time'
-      ? Math.floor(e.bestTime/60).toString().padStart(2,'0') + ':' + (e.bestTime%60).toString().padStart(2,'0')
-      : (e.solvedCount || 0) + ' gelöst';
+      ? Math.floor(e.best_time/60).toString().padStart(2,'0') + ':' + (e.best_time%60).toString().padStart(2,'0')
+      : (e.solved_count || 0) + ' gelöst';
     rows += `<div class="lb-row">
       <div><span class="rank">${i+1}</span><span>${escapeHtml(e.name)}</span></div>
       <span class="value">${value}</span>
@@ -755,25 +760,52 @@ function escapeHtml(str){
   return div.innerHTML;
 }
 
-function submitScore(timeInSeconds, level){
+async function submitScore(timeInSeconds, level){
   const name = usernameInput.value.trim() || 'Anonym';
-  const key = name.toLowerCase().replace(/[^a-z0-9]/g, '_') || 'anonym';
-  const lb = loadLeaderboard();
-  const data = lb[key] || {name: name, bestTime: null, solvedCount: 0, solvedLevels: {}};
-  data.name = name;
 
-  if(!data.solvedLevels) data.solvedLevels = {};
-  if(!data.solvedLevels[level]){
-    data.solvedLevels[level] = true;
-    data.solvedCount = (data.solvedCount || 0) + 1;
+  try{
+    const { data: existing, error: fetchError } = await supabaseClient
+      .from('leaderboard')
+      .select('*')
+      .eq('name', name)
+      .maybeSingle();
+
+    if(fetchError){
+      console.error('Leaderboard fetch error', fetchError);
+      return;
+    }
+
+    const solvedLevels = (existing && existing.solved_levels) || {};
+    let solvedCount = (existing && existing.solved_count) || 0;
+    if(!solvedLevels[level]){
+      solvedLevels[level] = true;
+      solvedCount += 1;
+    }
+
+    let bestTime = (existing && existing.best_time) != null ? existing.best_time : null;
+    if(bestTime === null || timeInSeconds < bestTime){
+      bestTime = timeInSeconds;
+    }
+
+    const { error: upsertError } = await supabaseClient
+      .from('leaderboard')
+      .upsert({
+        name: name,
+        best_time: bestTime,
+        solved_count: solvedCount,
+        solved_levels: solvedLevels,
+        updated_at: new Date().toISOString()
+      }, { onConflict: 'name' });
+
+    if(upsertError){
+      console.error('Leaderboard upsert error', upsertError);
+      return;
+    }
+  }catch(e){
+    console.error('Leaderboard error', e);
+    return;
   }
 
-  if(data.bestTime === null || timeInSeconds < data.bestTime){
-    data.bestTime = timeInSeconds;
-  }
-
-  lb[key] = data;
-  saveLeaderboard(lb);
   renderLeaderboard();
 }
 
